@@ -355,7 +355,7 @@ Return EXACTLY {batch_size} turns as a JSON array (no markdown):
 [{{"speaker": "{current_host}", "german": "...", "english": "..."}},
  {{"speaker": "{next_host}", "german": "...", "english": "..."}}]"""
 
-    for attempt in range(4):
+    for attempt in range(3):
         try:
             resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
                 "model": AI_MODEL,
@@ -364,7 +364,7 @@ Return EXACTLY {batch_size} turns as a JSON array (no markdown):
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.9
-            }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}, timeout=180)
+            }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}, timeout=60)
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"].strip()
             if "```json" in content:
@@ -428,22 +428,22 @@ def generate_script():
     BATCH = 10
     all_turns = []
     consecutive_empty = 0
+    import time as _time
+    _deadline = _time.time() + 300  # hard cap: give up after 5 min of script generation
 
-    while len(all_turns) < TARGET and consecutive_empty < 6:
+    while len(all_turns) < TARGET and consecutive_empty < 6 and _time.time() < _deadline:
         batch = _fetch_turns_batch(topic, topic_es, topic_en, len(all_turns), BATCH)
         if not batch:
             consecutive_empty += 1
             if consecutive_empty >= 3:
-                import time
                 print("  API busy - waiting 10s before retrying...")
-                time.sleep(10)
+                _time.sleep(10)
             continue
         all_turns.extend(batch)
         consecutive_empty = 0
         print(f"  Script progress: {len(all_turns)}/{TARGET} turns")
         if len(all_turns) < TARGET:
-            import time
-            time.sleep(2)
+            _time.sleep(2)
 
     all_turns = all_turns[:TARGET]
 
@@ -622,7 +622,7 @@ def build_podcast_title(topic_es, topic_en):
     titles = [
         f"German Podcast: {topic_es} | Aprende German",
         f"Learn German: {topic_es} | Bilingual Podcast",
-        f"{topic_es} | {LK_up} Conversation for Beginners",
+        f"{topic_es} | German Conversation for Beginners",
         f"{topic_es} | Practica Tu German",
     ]
     return random.choice(titles)
@@ -645,7 +645,7 @@ def build_podcast_description(topic_es, topic_en, turns_count, duration_min):
         f"4️⃣ Vuelve a escuchar mañana - ¡cada día es más fácil!\n\n"
         f"🔔 Subscribe para una nueva lección cada día.\n\n"
         f"📅 Duración: {duration_min} minutos\n\n"
-        f"#LearnGerman #{LK_up}Podcast #Bilingual #LanguageLearning"
+        f"#LearnGerman #GermanPodcast #Bilingual #LanguageLearning"
     )
     return description
 
