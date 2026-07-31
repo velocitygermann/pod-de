@@ -352,8 +352,8 @@ Simple present tense. A2 vocabulary. Natural German. NO filler sounds.
 IMPORTANT: Highlight exactly 1 key A2 target vocabulary word in each turn's German text using double asterisks, for example: "Wir schauen in die **Zukunft**."
 
 Return EXACTLY {batch_size} turns as a JSON array (no markdown):
-[{"speaker": "{current_host}", "german": "...", "english": "..."},
- {"speaker": "{next_host}", "german": "...", "english": "..."}]"""
+[{{"speaker": "{current_host}", "german": "...", "english": "..."}},
+ {{"speaker": "{next_host}", "german": "...", "english": "..."}}]"""
 
     for attempt in range(4):
         try:
