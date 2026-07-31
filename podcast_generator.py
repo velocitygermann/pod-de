@@ -620,31 +620,31 @@ async def main():
 
 def build_podcast_title(topic_es, topic_en):
     titles = [
-        f"German Podcast: {topic_es} | Aprende German",
+        f"German Podcast: {topic_es} | Lerne Deutsch",
         f"Learn German: {topic_es} | Bilingual Podcast",
         f"{topic_es} | German Conversation for Beginners",
-        f"{topic_es} | Practica Tu German",
+        f"{topic_es} | Übe dein Deutsch mit Maria und Lukas",
     ]
     return random.choice(titles)
 
 
 def build_podcast_description(topic_es, topic_en, turns_count, duration_min):
     description = (
-        f"🎙️ ¡Bienvenidos a Velocity German Podcast!\n\n"
-        f"En este episodio, Maria y Lukas conversan sobre: {topic_es} ({topic_en}).\n"
-        f"Una conversación bilingüe y relajada, a nivel A2, para que aprendas German de forma natural.\n\n"
+        f"🎙️ Willkommen bei Velocity German Podcast!\n\n"
+        f"In dieser Folge unterhalten sich Maria und Lukas über: {topic_es} ({topic_en}).\n"
+        f"Eine entspannte zweisprachige Unterhaltung auf A2-Niveau, um Deutsch auf natürliche Weise zu lernen.\n\n"
         f"✨ WHAT'S INSIDE THIS EPISODE:\n"
-        f"• {turns_count} frases y expresiones útiles en German\n"
-        f"• Conversación real con vocabulario cotidiano\n"
-        f"• Pronunciación natural de hablantes nativos\n"
-        f"• Traducción al inglés en cada línea\n\n"
+        f"• {turns_count} nützliche Sätze und Ausdrücke auf Deutsch\n"
+        f"• Echte Gespräche mit alltäglichem Wortschatz\n"
+        f"• Natürliche Aussprache von Muttersprachlern\n"
+        f"• Englische Übersetzung in jeder Zeile\n\n"
         f"📌 HOW TO USE THIS PODCAST:\n"
-        f"1️⃣ Escucha la parte en German e intenta entenderla\n"
-        f"2️⃣ Comprueba la traducción al inglés\n"
-        f"3️⃣ Repite las frases en voz alta\n"
-        f"4️⃣ Vuelve a escuchar mañana - ¡cada día es más fácil!\n\n"
-        f"🔔 Subscribe para una nueva lección cada día.\n\n"
-        f"📅 Duración: {duration_min} minutos\n\n"
+        f"1️⃣ Höre den deutschen Teil und versuche zu verstehen\n"
+        f"2️⃣ Prüfe die englische Übersetzung\n"
+        f"3️⃣ Sprich die Sätze laut nach\n"
+        f"4️⃣ Höre morgen wieder - jeden Tag wird es einfacher!\n\n"
+        f"🔔 Abonniere für eine neue Lektion jeden Tag.\n\n"
+        f"📅 Dauer: {duration_min} Minuten\n\n"
         f"#LearnGerman #GermanPodcast #Bilingual #LanguageLearning"
     )
     return description
