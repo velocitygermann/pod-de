@@ -300,8 +300,31 @@ def create_frame(turn, output_path, frame_num=0):
     draw.text((pill_x + pill_w + 25, pill_y + 26), "spricht", fill=LIGHT_GRAY, font=f_hablando, anchor="lm")
 
     # === MAIN GERMAN TEXT ===
+
+    # === MAIN TEXT (auto-size to fit max 3 lines) ===
     german_text = turn.get("german", turn.get("spanish", ""))
-    draw_rich_text_centered(draw, german_text, center_y=440, font=f_german, max_w=1550, line_height=90)
+    chosen_font = f_german
+    chosen_lh = 90
+    for test_size in [64, 56, 48, 40, 34]:
+        test_font = load_font(test_size, bold=True)
+        test_lh = int(test_size * 1.4)
+        text_words = german_text.split()
+        tmp_lines = []
+        cur = []
+        for w in text_words:
+            test = ' '.join(cur + [w])
+            bb = draw.textbbox((0, 0), test, font=test_font)
+            if bb[2] - bb[0] <= 1550 or not cur:
+                cur.append(w)
+            else:
+                tmp_lines.append(' '.join(cur))
+                cur = [w]
+        if cur: tmp_lines.append(' '.join(cur))
+        if len(tmp_lines) <= 3 or test_size <= 34:
+            chosen_font = test_font
+            chosen_lh = test_lh
+            break
+    draw_rich_text_centered(draw, german_text, center_y=440, font=chosen_font, max_w=1550, line_height=chosen_lh)
 
     # === CENTER DIVIDER WITH DOT ===
     div_y = 615
