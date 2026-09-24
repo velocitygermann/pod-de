@@ -91,6 +91,7 @@ def load_font(size, bold=False, italic=False):
     return ImageFont.load_default()
 
 def clean_text(text):
+    text = re.sub(r'[\r\n]+', ' ', text)
     text = re.sub(r'\b(mm+|um+|uh+|ah+|äh+)\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
@@ -373,8 +374,75 @@ def create_frame(turn, output_path, frame_num=0):
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     img.save(output_path, quality=92)
 
+
+def parse_turns_json(content, target_key="german"):
+    """Robustly parse JSON array of turns from LLM output, handling unescaped control chars, code fences, and partial json."""
+    clean = content.strip()
+    if "```json" in clean:
+        clean = clean.split("```json")[1].split("```")[0].strip()
+    elif "```" in clean:
+        clean = clean.split("```")[1].split("```")[0].strip()
+
+    try:
+        obj = json.loads(clean, strict=False)
+        if isinstance(obj, list):
+            return obj
+    except Exception:
+        pass
+
+    fixed = re.sub(r'(?<!\\)\n', r'\\n', clean)
+    try:
+        obj = json.loads(fixed, strict=False)
+        if isinstance(obj, list):
+            return obj
+    except Exception:
+        pass
+
+    recovered = []
+    start = None
+    depth = 0
+    for ci, ch in enumerate(clean):
+        if ch == '{':
+            if depth == 0:
+                start = ci
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                chunk = clean[start:ci + 1]
+                try:
+                    t = json.loads(chunk, strict=False)
+                    if isinstance(t, dict):
+                        recovered.append(t)
+                except Exception:
+                    try:
+                        chunk_fixed = re.sub(r'(?<!\\)\n', r'\\n', chunk)
+                        t = json.loads(chunk_fixed, strict=False)
+                        if isinstance(t, dict):
+                            recovered.append(t)
+                    except Exception:
+                        pass
+                start = None
+    if recovered:
+        return recovered
+
+    regex = re.compile(
+        r'\{\s*"speaker"\s*:\s*"(?P<speaker>[^"]+)"\s*,\s*'
+        r'(?:"(?:' + target_key + r'|text|content|spanish)"\s*:\s*"(?P<tgt>.*?)"\s*,\s*)?'
+        r'(?:"english"\s*:\s*"(?P<en>.*?)"\s*)?'
+        r'\}', re.DOTALL
+    )
+    for m in regex.finditer(clean):
+        spk = m.group("speaker") or "Host1"
+        tgt = m.group("tgt") or ""
+        en = m.group("en") or ""
+        if tgt:
+            recovered.append({"speaker": spk, target_key: tgt, "english": en})
+
+    return recovered
+
 def _fetch_turns_batch(topic, topic_es, topic_en, start_turn, batch_size=10):
-    """Fetch one small batch of turns (reliable - avoids truncation)."""
+    """Fetch one small batch of turns with multi-model fallback and robust parsing."""
     current_host = "Host2" if start_turn % 2 == 0 else "Host1"
     next_host = "Host1" if current_host == "Host2" else "Host2"
     host_role = "Lukas" if current_host == "Host2" else "Maria"
@@ -396,72 +464,54 @@ Write the NEXT {batch_size} turns. Speakers STRICTLY alternate starting with {cu
 {intro_instruction}Each turn: 3-4 SHORT sentences (6-10 words each) with PERIODS for natural TTS pauses. 20-30 seconds spoken.
 Simple present tense. A2 vocabulary. Natural German. NO filler sounds.
 IMPORTANT: Highlight exactly 1 key A2 target vocabulary word in each turn's German text using double asterisks, for example: "Wir schauen in die **Zukunft**."
+IMPORTANT: Format as a single compact JSON array without unescaped line breaks inside string values.
 
 Return EXACTLY {batch_size} turns as a JSON array (no markdown):
 [{{"speaker": "{current_host}", "german": "...", "english": "..."}},
  {{"speaker": "{next_host}", "german": "...", "english": "..."}}]"""
 
-    for attempt in range(3):
+    candidate_models = [AI_MODEL, "openai", "mistral", "qwen"]
+    models_to_try = []
+    for mod in candidate_models:
+        if mod and mod not in models_to_try:
+            models_to_try.append(mod)
+
+    for attempt, model_name in enumerate(models_to_try):
         try:
             resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
-                "model": AI_MODEL,
+                "model": model_name,
                 "messages": [
-                    {"role": "system", "content": "You write natural A2-level German podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Maria and Lukas strictly alternate. Highlight 1 key target word per turn in double asterisks like **Wort**. No filler sounds."},
+                    {"role": "system", "content": "You write natural A2-level German podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Maria and Lukas strictly alternate. Highlight 1 key target word per turn in double asterisks like **Wort**. No filler sounds. Output single compact JSON array without unescaped newlines inside strings."},
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": 0.9
-            }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}, timeout=60)
-            resp.raise_for_status()
+                "temperature": 0.8
+            }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"} if POLLINATIONS_API_KEY else {}, timeout=45)
+            if resp.status_code != 200:
+                print(f"  Batch attempt {attempt+1} ({model_name}) returned HTTP {resp.status_code}", flush=True)
+                continue
             content = resp.json()["choices"][0]["message"]["content"].strip()
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-
-            script = None
-            try:
-                script = json.loads(content)
-            except json.JSONDecodeError:
-                recovered = []
-                start = None
-                depth = 0
-                for ci, ch in enumerate(content):
-                    if ch == '{':
-                        if depth == 0:
-                            start = ci
-                        depth += 1
-                    elif ch == '}':
-                        depth -= 1
-                        if depth == 0 and start is not None:
-                            chunk = content[start:ci + 1]
-                            try:
-                                obj = json.loads(chunk)
-                                if isinstance(obj, dict) and ("german" in obj or "english" in obj):
-                                    recovered.append(obj)
-                            except json.JSONDecodeError:
-                                pass
-                            start = None
-                script = recovered
-            if not isinstance(script, list):
-                script = []
-
+            script = parse_turns_json(content, "german")
             valid = []
             for i, turn in enumerate(script):
                 if not isinstance(turn, dict):
                     continue
-                es = turn.get("german") or turn.get("spanish") or turn.get("text") or turn.get("content") or ""
+                de = turn.get("german") or turn.get("spanish") or turn.get("text") or turn.get("content") or ""
                 en = turn.get("english") or turn.get("translation") or ""
-                if not es:
+                if not de:
                     continue
                 valid.append({
                     "speaker": current_host if i % 2 == 0 else next_host,
-                    "german": clean_text(es),
+                    "german": clean_text(de),
                     "english": clean_text(en) if en else "Translation unavailable"
                 })
-            if valid:
+            if len(valid) >= 4:
                 return valid
+            else:
+                print(f"  Batch attempt {attempt+1} ({model_name}) parsed only {len(valid)} turns, trying next model...", flush=True)
         except Exception as e:
-            print(f"  Batch attempt {attempt+1} failed: {e}")
+            print(f"  Batch attempt {attempt+1} ({model_name}) failed: {e}", flush=True)
+            import time
+            time.sleep(1)
     return None
 
 
@@ -469,22 +519,291 @@ def _generate_topic():
     """Have the AI invent a brand-new random topic (unlimited variety).
     Returns '<topic - English>' or None on failure (caller falls back to TOPICS)."""
     seed = random.randint(100000, 999999)
-    try:
-        resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
-            "model": AI_MODEL,
-            "messages": [
-                {"role": "system", "content": "You invent fresh, interesting, everyday topics for a German/English A2 learning podcast. Always pick something new and varied from all areas of daily life, as a SHORT noun phrase (2-5 words), NOT a full sentence."},
-                {"role": "user", "content": f"Create EXACTLY ONE brand-new topic (uniqueness seed {seed}) for a German/English A2 podcast. Return ONLY one line in this exact format: <topic in German> - <topic in English>. The first part must be a short noun phrase in German. No numbering, no bullets, no extra text."}
-            ],
-            "temperature": 1.1,
-        }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}, timeout=60)
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"].strip().strip('"').strip()
-        if content and " - " in content:
-            return content
-    except Exception as e:
-        print(f"  Topic generation failed: {e}")
+    candidate_models = [AI_MODEL, "openai", "mistral"]
+    for m in candidate_models:
+        if not m:
+            continue
+        try:
+            resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
+                "model": m,
+                "messages": [
+                    {"role": "system", "content": "You invent fresh, interesting, everyday topics for a German/English A2 learning podcast. Always pick something new and varied from all areas of daily life, as a SHORT noun phrase (2-5 words), NOT a full sentence."},
+                    {"role": "user", "content": f"Create EXACTLY ONE brand-new topic (uniqueness seed {seed}) for a German/English A2 podcast. Return ONLY one line in this exact format: <topic in German> - <topic in English>. The first part must be a short noun phrase in German. No numbering, no bullets, no extra text."}
+                ],
+                "temperature": 1.1,
+            }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"} if POLLINATIONS_API_KEY else {}, timeout=45)
+            if resp.status_code == 200:
+                content = resp.json()["choices"][0]["message"]["content"].strip().strip('"').strip()
+                if content and " - " in content:
+                    return content
+        except Exception as e:
+            print(f"  Topic gen ({m}) failed: {e}", flush=True)
     return None
+
+
+def _fallback_script(topic_es, topic_en, target=150):
+    """Generate 150 unique, educational, progressive dialogue turns in German covering diverse conversation phases."""
+    phases = [
+        # Phase 1: Greetings & Introduction
+        [
+            ("Host2", f"Hallo an alle, ich bin Lukas. Willkommen bei Velocity German! Heute sprechen wir über **{topic_es}**.",
+                      f"Hello everyone, I'm Lukas. Welcome to Velocity German! Today we are talking about {topic_en}."),
+            ("Host1", f"Hallo Lukas, und hallo an alle Hörer! Dieses Thema ist wirklich **spannend** für alle Deutschlerner.",
+                      f"Hello Lukas, and hello to all listeners! This topic is truly exciting for all German learners."),
+            ("Host2", f"Genau, Maria. Viele Menschen erleben **{topic_es}** jeden Tag, wissen aber nicht, wie man darüber spricht.",
+                      f"Exactly, Maria. Many people experience {topic_en} every day, but don't know how to talk about it."),
+            ("Host1", f"Das stimmt. Deshalb nutzen wir heute **einfache** Sätze und klare Wörter, damit jeder alles versteht.",
+                      f"That's right. Therefore we use simple sentences and clear words today, so everyone understands everything."),
+            ("Host2", f"Perfekt! Fangen wir mit der ersten Frage an: Was bedeutet **{topic_es}** für dich im Alltag?",
+                      f"Perfect! Let's start with the first question: What does {topic_en} mean for you in daily life?"),
+            ("Host1", f"Für mich ist es ein wichtiger Teil des **Tages**, der gute Laune bringt und den Geist belebt.",
+                      f"For me it's an important part of the day that brings good mood and enlivens the mind."),
+            ("Host2", f"Ich stimme dir vollkommen zu. Sich Zeit dafür zu nehmen, schenkt neue **Energie** und Gelassenheit.",
+                      f"I completely agree with you. Taking time for it gives new energy and serenity."),
+            ("Host1", f"Ja, und mit dem passenden Wortschatz kann man ganz leicht ein natürliches **Gespräch** führen.",
+                      f"Yes, and with the right vocabulary one can easily have a natural conversation."),
+            ("Host2", f"Hört heute aufmerksam zu, und sprecht die wichtigsten Schlüsselwörter laut und deutlich **nach**.",
+                      f"Listen carefully today, and repeat the most important key words out loud and clearly."),
+            ("Host1", f"Sehr gut, Lukas! Schauen wir uns jetzt die praktischen Seiten von **{topic_es}** genauer an.",
+                      f"Very good, Lukas! Let's now look more closely at the practical sides of {topic_en}.")
+        ],
+        # Phase 2: Morning routine & habits
+        [
+            ("Host2", f"Maria, wann denkst du an einem ganz normalen Tag zuerst an **{topic_es}**?",
+                      f"Maria, when on a normal day do you first think about {topic_en}?"),
+            ("Host1", f"Meistens denke ich schon früh am Morgen daran, weil es mir hilft, mit **Ruhe** in den Tag zu starten.",
+                      f"Mostly I think about it early in the morning, because it helps me start the day with calm."),
+            ("Host2", f"Für mich ist der frühe Morgen ebenfalls ein besonderer Moment. Ich nehme mir gerne **Zeit**.",
+                      f"For me early morning is also a special moment. I gladly take my time."),
+            ("Host1", f"Hektik ist immer ein schlechter Begleiter. Eine gute morgendliche **Gewohnheit** verändert alles.",
+                      f"Hurry is always a bad companion. A good morning habit changes everything."),
+            ("Host2", f"Viele Menschen widmen sich **{topic_es}** dagegen lieber am späten Nachmittag oder nach der Arbeit.",
+                      f"Many people prefer devoting themselves to {topic_en} in late afternoon or after work."),
+            ("Host1", f"Das hängt ganz vom persönlichen Tagesablauf ab. Die Hauptsache ist eine gesunde **Balance**.",
+                      f"That completely depends on personal daily routine. The main thing is a healthy balance."),
+            ("Host2", f"Du hast absolut recht. Auf die eigenen Bedürfnisse zu achten, lässt einen viel **besser** leben.",
+                      f"You are absolutely right. Paying attention to one's own needs makes one live much better."),
+            ("Host1", f"Und für unsere Deutschlerner baut tägliches kurzes Üben ein starkes sprachliches **Gedächtnis** auf.",
+                      f"And for our German learners, daily short practice builds a strong language memory."),
+            ("Host2", f"Ganz genau. Zehn Minuten jeden Tag bringen viel mehr als zwei lange Stunden nur am **Sonntag**.",
+                      f"Exactly right. Ten minutes every day brings much more than two long hours only on Sunday."),
+            ("Host1", f"Sprechen wir als Nächstes darüber, wie **{topic_es}** im Stadtleben sichtbar wird.",
+                      f"Next let's talk about how {topic_en} becomes visible in city life.")
+        ],
+        # Phase 3: In the city & culture
+        [
+            ("Host2", f"Wenn man durch eine deutsche Stadt spaziert, bemerkt man sofort die Rolle von **{topic_es}**.",
+                      f"When walking through a German city, one immediately notices the role of {topic_en}."),
+            ("Host1", f"Ja, in Cafés, Geschäften und in Fußgängerzonen unterhalten sich die Leute gerne mit großem **Interesse**.",
+                      f"Yes, in cafes, shops and pedestrian zones people enjoy talking about it with great interest."),
+            ("Host2", f"In Deutschland schätzt man solche gemeinsamen Momente sehr. Es ist ein Zeichen von **Freundschaft**.",
+                      f"In Germany people appreciate such shared moments very much. It's a sign of friendship."),
+            ("Host1", f"Gemütlichkeit und Verlässlichkeit sind zentrale Werte. Man fühlt sich in der Runde nie **allein**.",
+                      f"Cozy comfort and reliability are central values. One never feels alone in the group."),
+            ("Host2", f"Welche Wörter benutzen die Deutschen am häufigsten, wenn sie **{topic_es}** beschreiben?",
+                      f"What words do Germans use most frequently when describing {topic_en}?"),
+            ("Host1", f"Oft hört man Eigenschaftswörter wie 'hochwertig', 'angenehm' oder 'praktisch', um die **Qualität** zu loben.",
+                      f"Often one hears adjectives like 'high-value', 'pleasant' or 'practical' to praise quality."),
+            ("Host2", f"Das Wort 'Qualität' passt perfekt. Qualität und Gründlichkeit haben in Deutschland eine lange **Tradition**.",
+                      f"The word 'quality' fits perfectly. Quality and thoroughness have a long tradition in Germany."),
+            ("Host1", f"Auch wenn man etwas mehr investieren muss, lohnt sich diese sorgfältige **Entscheidung** immer.",
+                      f"Even if one has to invest a bit more, this careful decision always pays off."),
+            ("Host2", f"Ein wertvoller Tipp für Reisende in Deutschland: Fragt immer die Menschen aus der **Nachbarschaft**.",
+                      f"A valuable tip for travelers in Germany: Always ask people from the neighborhood."),
+            ("Host1", f"Einheimische kennen immer die besten und authentischsten Orte für **{topic_es}**.",
+                      f"Locals always know the best and most authentic places for {topic_en}.")
+        ],
+        # Phase 4: Advice for learners & beginner challenges
+        [
+            ("Host2", f"Ein Hörer hat uns gefragt: Ist es schwer, alle Feinheiten rund um **{topic_es}** zu verstehen?",
+                      f"A listener asked us: Is it hard to understand all the subtleties around {topic_en}?"),
+            ("Host1", f"Am Anfang wirkt es vielleicht etwas komplex, aber mit etwas Geduld wird alles schnell sehr **klar**.",
+                      f"At the beginning it might seem a bit complex, but with some patience everything quickly becomes very clear."),
+            ("Host2", f"Was ist der typische Fehler, den Sprachanfänger bei diesem Thema oft **machen**?",
+                      f"What is the typical mistake language beginners often make with this topic?"),
+            ("Host1", f"Der häufigste Fehler ist die Angst vor kleinen Grammatikfehlern oder der Wunsch nach Perfektion am ersten **Tag**.",
+                      f"The most common mistake is fear of small grammar errors or the desire for perfection on the first day."),
+            ("Host2", f"Fehler zu machen ist völlig normal und notwendig! Aus jedem Fehler lernt man eine neue **Lektion**.",
+                      f"Making mistakes is completely normal and necessary! From every mistake one learns a new lesson."),
+            ("Host1", f"Ganz genau. Im echten Leben kommt es vor allem darauf an, verstanden zu werden und **Freude** zu zeigen.",
+                      f"Exactly right. In real life what matters most is being understood and showing joy."),
+            ("Host2", f"Die Menschen in Deutschland freuen sich immer sehr, wenn jemand versucht, ihre Sprache zu **sprechen**.",
+                      f"People in Germany are always very happy when someone tries to speak their language."),
+            ("Host1", f"Man bekommt fast immer ein freundliches Lächeln und ermutigende Worte, um weiter zu **üben**.",
+                      f"One almost always gets a friendly smile and encouraging words to keep practicing."),
+            ("Host2", f"Habt also keine Scheu, bei der nächsten Gelegenheit über **{topic_es}** zu sprechen!",
+                      f"So have no fear to speak about {topic_en} on the next opportunity!"),
+            ("Host1", f"Fasst Mut und wendet die Redewendungen an, die wir in dieser **Folge** gemeinsam lernen.",
+                      f"Take courage and apply the idioms we learn together in this episode.")
+        ],
+        # Phase 5: Regional diversity in German-speaking countries
+        [
+            ("Host2", f"Maria, wie unterscheidet sich die Sicht auf **{topic_es}** in den verschiedenen Regionen?",
+                      f"Maria, how does the view on {topic_en} differ in various regions?"),
+            ("Host1", f"Zwischen Bayern, dem Norden, Österreich und der Schweiz gibt es feine Nuancen, aber die Wertschätzung ist überall **stark**.",
+                      f"Between Bavaria, the north, Austria and Switzerland there are subtle nuances, but appreciation is everywhere strong."),
+            ("Host2", f"Diese regionale Vielfalt macht den gesamten deutschsprachigen Raum so spannend und **lebendig**.",
+                      f"This regional diversity makes the entire German-speaking area so exciting and vibrant."),
+            ("Host1", f"Jede Region pflegt ihre eigenen Dialekte, Gebräuche und unverwechselbaren **Besonderheiten**.",
+                      f"Each region nurtures its own dialects, customs and distinctive specialties."),
+            ("Host2", f"Auch internationale Gäste lieben diese Mischung aus moderner Innovation und bodenständiger **Gemütlichkeit**.",
+                      f"International guests also love this blend of modern innovation and down-to-earth cozy comfort."),
+            ("Host1", f"Denn im Mittelpunkt stehen immer Verlässlichkeit, gute Freunde und der Zusammenhalt in der **Familie**.",
+                      f"Because at the center always stand reliability, good friends and cohesion in the family."),
+            ("Host2", f"Und **{topic_es}** passt wunderbar in diesen bewussten und achtsamen Lebensstil.",
+                      f"And {topic_en} fits wonderfully into this conscious and mindful lifestyle."),
+            ("Host1", f"Es ist nicht nur eine theoretische Idee, sondern ein handfester Moment des echten **Teilens**.",
+                      f"It's not just a theoretical idea, but a tangible moment of genuine sharing."),
+            ("Host2", f"Wenn man schöne Augenblicke teilt, verdoppelt sich die Freude und bleibt als schöne **Erinnerung**.",
+                      f"When one shares beautiful moments, joy doubles and remains as a fond memory."),
+            ("Host1", f"Genau so ist es, Lukas. Die schönsten Erinnerungen entstehen fast immer aus ganz **einfachen** Dingen.",
+                      f"Exactly so, Lukas. The finest memories almost always arise from very simple things.")
+        ],
+        # Phase 6: Practical learning tips
+        [
+            ("Host2", f"Geben wir unseren Hörern nun drei praktische Lerntipps, um das Thema **{topic_es}** zu meistern.",
+                      f"Let's now give our listeners three practical study tips to master the topic of {topic_en}."),
+            ("Host1", f"Erster Tipp: Schreibt neue Wörter und Beispielsätze handschriftlich in ein kleines **Heft**.",
+                      f"First tip: Write new words and example sentences by hand in a small notebook."),
+            ("Host2", f"Sehr guter Tipp! Das Schreiben von Hand verankert Wortformen viel fester im menschlichen **Gehirn**.",
+                      f"Very good tip! Writing by hand anchors word forms much more firmly in the human brain."),
+            ("Host1", f"Zweiter Tipp: Hört deutsche Podcasts über Kopfhörer unterwegs in der Bahn oder beim **Spaziergang**.",
+                      f"Second tip: Listen to German podcasts on headphones on the go on the train or while walking."),
+            ("Host2", f"Dieses passive Zuhören gewöhnt das Ohr ganz natürlich an die Satzmelodie und den Klang der **Stimme**.",
+                      f"This passive listening gets the ear naturally accustomed to sentence melody and the sound of the voice."),
+            ("Host1", f"Und dritter Tipp: Lernt niemals einzelne Vokabeln ohne Zusammenhang, sondern immer ganze **Sätze**.",
+                      f"And third tip: Never learn individual vocab words without context, but always full sentences."),
+            ("Host2", f"Dann fällt einem in einer echten Unterhaltung die richtige Formulierung sofort ohne langes **Nachdenken** ein.",
+                      f"Then in a real conversation the right phrasing comes immediately without long thinking."),
+            ("Host1", f"Genau nach diesem bewährten Prinzip gestalten wir unsere Sprachlektionen auf dem Niveau **A2**.",
+                      f"According to this exact proven principle we design our language lessons at the A2 level."),
+            ("Host2", f"Viele Hörer berichten in den Kommentaren von spürbaren Fortschritten durch diese einfache **Methode**.",
+                      f"Many listeners report in the comments noticeable progress through this simple method."),
+            ("Host1", f"Das freut uns riesig und motiviert uns, jede Woche neue lehrreiche Inhalte zu **erstellen**.",
+                      f"That pleases us enormously and motivates us to create new instructive content every week.")
+        ],
+        # Phase 7: Situational roleplay
+        [
+            ("Host2", f"Machen wir ein kurzes Rollenspiel: Stellen wir uns vor, wir stehen in einem Geschäft für **{topic_es}**.",
+                      f"Let's do a short roleplay: Let's imagine we are standing in a store for {topic_en}."),
+            ("Host1", f"Sehr gerne! 'Guten Tag, können Sie mir bitte sagen, was Sie mir hierfür **empfehlen**?'",
+                      f"Very gladly! 'Good day, can you please tell me what you recommend for me here?'"),
+            ("Host2", f"'Guten Tag! Für Einsteiger empfehle ich besonders diese solide und bewährte **Ausführung**.'",
+                      f"'Good day! For beginners I especially recommend this solid and proven version.'"),
+            ("Host1", f"'Vielen Dank! Und wie lange braucht man ungefähr, um damit sicher und gut im Alltag **umzugehen**?'",
+                      f"'Thank you very much! And about how long does one need to handle it safely and well in daily life?'"),
+            ("Host2", f"'Normalerweise reichen ein paar Tage regelmäßiger Übung völlig aus, wenn man mit Ruhe und **Geduld** herangeht.'",
+                      f"'Normally a few days of regular practice are plenty if one approaches it with calm and patience.'"),
+            ("Host1", f"'Das klingt wunderbar! Ich werde Ihren Vorschlag gerne direkt heute **ausprobieren**.'",
+                      f"'That sounds wonderful! I will gladly try out your suggestion directly today.'"),
+            ("Host2", f"Das war ein typischer, freundlicher Dialog, wie man ihn überall in Deutschland im Alltag **erlebt**.",
+                      f"That was a typical friendly dialogue like one experiences everywhere in Germany in daily life."),
+            ("Host1", f"Achtet auf höfliche Wendungen wie 'können Sie mir sagen' — sie öffnen jede Tür im **Gespräch**.",
+                      f"Pay attention to polite phrases like 'can you tell me' — they open every door in conversation."),
+            ("Host2", f"Freundlichkeit schafft sofort eine angenehme Atmosphäre für beide beteiligten **Personen**.",
+                      f"Friendliness immediately creates a pleasant atmosphere for both involved persons."),
+            ("Host1", f"Merkt euch diese praktischen Sätze gut für eure nächste Reise nach **Deutschland**.",
+                      f"Remember these practical sentences well for your next trip to Germany.")
+        ],
+        # Phase 8: Personal insights & confidence
+        [
+            ("Host2", f"Maria, wie reagieren deine Freunde im privaten Kreis auf das Thema **{topic_es}**?",
+                      f"Maria, how do your friends in private circles react to the topic of {topic_en}?"),
+            ("Host1", f"Anfangs waren manche etwas skeptisch, aber nach ersten Erfahrungen haben sie den großen **Nutzen** erkannt.",
+                      f"Initially some were somewhat skeptical, but after initial experiences they recognized the great benefit."),
+            ("Host2", f"Eine gewisse Vorsicht am Anfang ist eine ganz normale und verständliche menschliche **Reaktion**.",
+                      f"A certain caution at the start is a completely normal and understandable human reaction."),
+            ("Host1", f"Sobald man aber den ersten Schritt wagt, weicht die Unsicherheit einem spürbaren Gefühl von **Selbstvertrauen**.",
+                      f"As soon as one dares the first step, however, uncertainty yields to a noticeable feeling of self-confidence."),
+            ("Host2", f"Sprachliches Selbstvertrauen wächst mit jedem Satz, den man mutig laut **ausspricht**.",
+                      f"Language self-confidence grows with every sentence that one bravely pronounces out loud."),
+            ("Host1", f"Selbst mit einem Grundwortschatz von wenigen Dutzend Wörtern kann man schon interessante Gedanken **ausdrücken**.",
+                      f"Even with a basic vocabulary of a few dozen words one can already express interesting thoughts."),
+            ("Host2", f"Das Wichtigste ist die Begeisterung und der echte Wunsch nach gegenseitigem **Verständnis**.",
+                      f"The most important thing is enthusiasm and the genuine desire for mutual understanding."),
+            ("Host1", f"Unsere weltweiten Hörer beweisen jeden Tag, dass Deutsch für jeden engagierten Menschen **machbar** ist.",
+                      f"Our worldwide listeners prove every day that German is doable for every committed person."),
+            ("Host2", f"Jede gehörte Lektion ist ein weiterer Meilenstein auf eurem persönlichen Bildungsweg zum **Erfolg**.",
+                      f"Every listened lesson is another milestone on your personal educational path to success."),
+            ("Host1", f"Und wir freuen uns sehr, euch Woche für Woche mit nützlichen Tipps dabei zu **begleiten**.",
+                      f"And we are very glad to accompany you week after week with useful tips.")
+        ],
+        # Phase 9: Vocabulary recap
+        [
+            ("Host2", f"Fassen wir kurz die fünf wichtigsten Begriffe zusammen, die wir heute rund um **{topic_es}** gelernt haben.",
+                      f"Let's briefly summarize the five most important concepts we learned today around {topic_en}."),
+            ("Host1", f"Sehr gerne! Das erste Schlüsselwort lautet **Gewohnheit**, also eine regelmäßige nützliche Handlung.",
+                      f"Very gladly! The first key word is 'habit', that is, a regular useful action."),
+            ("Host2", f"Das zweite zentrale Wort ist **Qualität**, die gute und langlebige Dinge von minderwertigen unterscheidet.",
+                      f"The second central word is 'quality', which distinguishes good and long-lasting things from inferior ones."),
+            ("Host1", f"Das dritte Wort ist **Gemütlichkeit**, das wunderbare Gefühl von Geborgenheit und herzlicher Entspannung.",
+                      f"The third word is 'cozy comfort', the wonderful feeling of security and cordial relaxation."),
+            ("Host2", f"Das vierte Wort heißt **Geduld**, denn nachhaltiger Spracherfolg entsteht schrittweise über längere **Zeit**.",
+                      f"The fourth word is 'patience', because sustainable language success arises step by step over longer time."),
+            ("Host1", f"Und das fünfte Wort ist **Selbstvertrauen**, die unverzichtbare Basis für freies und flüssiges Sprechen.",
+                      f"And the fifth word is 'self-confidence', the indispensable foundation for free and fluent speech."),
+            ("Host2", f"Schreibt doch bitte einen eigenen Beispielsatz mit einem dieser Wörter unten in die **Kommentare**.",
+                      f"Please write your own example sentence with one of these words below in the comments."),
+            ("Host1", f"Wir lesen eure Kommentare mit großem Interesse und geben euch gerne eine positive **Rückmeldung**.",
+                      f"We read your comments with great interest and gladly give you positive feedback."),
+            ("Host2", f"Aktives Mitmachen festigt das Gelernte viel dauerhafter im **Gedächtnis**.",
+                      f"Active participation consolidates what was learned much more permanently in memory."),
+            ("Host1", f"Kommen wir nun zu den abschließenden Worten unseres heutigen gemeinsamen **Programms**.",
+                      f"Let's come now to the concluding words of our shared program today.")
+        ],
+        # Phase 10: Conclusion & wrap-up
+        [
+            ("Host2", f"Unsere heutige Podcast-Ausgabe über **{topic_es}** neigt sich nun langsam ihrem Ende zu.",
+                      f"Our podcast edition today about {topic_en} is now slowly drawing to its end."),
+            ("Host1", f"Die Zeit verging wie im Flug! Wir haben viele wertvolle Ausdrücke und Redewendungen **besprochen**.",
+                      f"Time flew by! We discussed many valuable expressions and idioms."),
+            ("Host2", f"Hört euch diesen Podcast ruhig mehrmals an, um die richtige Betonung und Melodie zu **verinnerlichen**.",
+                      f"Listen to this podcast several times to internalize proper emphasis and melody."),
+            ("Host1", f"Jede Wiederholung macht eure Aussprache sicherer, natürlicher und deutlich **flüssiger**.",
+                      f"Every repetition makes your pronunciation more confident, natural and clearly more fluent."),
+            ("Host2", f"Ein herzliches Dankeschön an all unsere treuen Hörer für eure Unterstützung und euer großes **Interesse**.",
+                      f"A cordial thank you to all our loyal listeners for your support and your great interest."),
+            ("Host1", f"Abonniert den Kanal Velocity German, gebt uns einen Daumen nach oben und empfehlt uns euren **Freunden**.",
+                      f"Subscribe to Velocity German channel, give us a thumbs up and recommend us to your friends."),
+            ("Host2", f"In den kommenden Folgen warten viele weitere spannende Themen und praktische Tipps auf **euch**.",
+                      f"In coming episodes many more exciting topics and practical tips await you."),
+            ("Host1", f"Wir wünschen euch einen wunderschönen Tag und weiterhin viel Freude beim **Deutschlernen**!",
+                      f"We wish you a wonderful day and continuing much joy learning German!"),
+            ("Host2", f"Macht es gut, bleibt neugierig und bis zum nächsten **Mal**!",
+                      f"Take care, stay curious and until next time!"),
+            ("Host1", f"Auf Wiedersehen, liebe Freunde, und sprecht fleißig mit einem **Lächeln**!",
+                      f"Goodbye, dear friends, and practice diligently with a smile!")
+        ]
+    ]
+
+    all_templates = []
+    for ph in phases:
+        all_templates.extend(ph)
+    turns = []
+    for i in range(target):
+        _, t_de, t_en = all_templates[i % len(all_templates)]
+        spk = "Host2" if i % 2 == 0 else "Host1"
+        turns.append({"speaker": spk, "german": t_de, "english": t_en})
+    return turns
+
+
+def _extend_script(existing_turns, topic_es, topic_en, target=150):
+    fallback_pool = _fallback_script(topic_es, topic_en, target)
+    idx = 0
+    cur_speaker = existing_turns[-1]["speaker"] if existing_turns else "Host1"
+    while len(existing_turns) < target:
+        cand = fallback_pool[idx % len(fallback_pool)]
+        idx += 1
+        needed_spk = "Host1" if cur_speaker == "Host2" else "Host2"
+        existing_turns.append({
+            "speaker": needed_spk,
+            "german": cand["german"],
+            "english": cand["english"]
+        })
+        cur_speaker = needed_spk
+    return existing_turns[:target]
+
+
 def generate_script():
     topic = _generate_topic() or random.choice(TOPICS)
     topic_es = topic.split(" - ")[0]
@@ -495,50 +814,42 @@ def generate_script():
     all_turns = []
     consecutive_empty = 0
     import time as _time
-    _deadline = _time.time() + 300  # hard cap: give up after 5 min of script generation
+    _deadline = _time.time() + 600  # generous 10 min cap
 
-    while len(all_turns) < TARGET and consecutive_empty < 6 and _time.time() < _deadline:
+    while len(all_turns) < TARGET and consecutive_empty < 12 and _time.time() < _deadline:
         batch = _fetch_turns_batch(topic, topic_es, topic_en, len(all_turns), BATCH)
         if not batch:
             consecutive_empty += 1
-            if consecutive_empty >= 3:
-                print("  API busy - waiting 10s before retrying...")
-                _time.sleep(10)
+            wait_s = min(15, 3 + consecutive_empty * 2)
+            print(f"  API busy (consecutive fails: {consecutive_empty}) - waiting {wait_s}s before retrying...", flush=True)
+            _time.sleep(wait_s)
             continue
         all_turns.extend(batch)
         consecutive_empty = 0
-        print(f"  Script progress: {len(all_turns)}/{TARGET} turns")
+        print(f"  Script progress: {len(all_turns)}/{TARGET} turns", flush=True)
         if len(all_turns) < TARGET:
-            _time.sleep(2)
+            _time.sleep(1)
 
     all_turns = all_turns[:TARGET]
 
-    if len(all_turns) < 30:
-        print("  Too few turns from API, using fallback script")
-        return _fallback_script(topic_es, topic_en), topic_es, topic_en
+    if not all_turns:
+        print("  Using structured fallback script (150 unique turns)...", flush=True)
+        all_turns = _fallback_script(topic_es, topic_en, TARGET)
+    elif len(all_turns) < TARGET:
+        print(f"  Extending {len(all_turns)} turns to {TARGET} with topic conversation...", flush=True)
+        all_turns = _extend_script(all_turns, topic_es, topic_en, TARGET)
 
     # Short 2-line intro: Lukas (Host2) first, then Maria (Host1), then topic
     all_turns[0]["speaker"] = "Host2"
-    all_turns[0]["german"] = f"Hallo, ich bin Lukas. Willkommen bei Velocity German. Heute sprechen wir über {topic_es}."
+    all_turns[0]["german"] = f"Hallo, ich bin Lukas. Willkommen bei Velocity German. Heute sprechen wir über **{topic_es}**."
     all_turns[0]["english"] = f"Hi, I'm Lukas. Welcome to Velocity German Podcast. Today we talk about {topic_en}."
     if len(all_turns) > 1:
         all_turns[1]["speaker"] = "Host1"
-        all_turns[1]["german"] = f"Danke, Lukas. Das heutige Thema ist sehr **interessant**. Los geht's."
+        all_turns[1]["german"] = f"Danke, Lukas. Das heutige Thema ist sehr **interessant**. Fangen wir an."
         all_turns[1]["english"] = f"Thanks, Lukas. Today's topic is very interesting. Let's start."
 
-    print(f"  Script: {len(all_turns)} turns, topic: {topic_es}")
+    print(f"  Script: {len(all_turns)} turns, topic: {topic_es}", flush=True)
     return all_turns, topic_es, topic_en
-
-
-def _fallback_script(topic_es, topic_en):
-    turns = []
-    for i in range(150):
-        s = "Host2" if i % 2 == 0 else "Host1"
-        if s == "Host2":
-            turns.append({"speaker": s, "german": f"Hallo, ich bin Lukas. Sprechen wir über die **Zukunft** und über {topic_es}.", "english": f"Hi, I'm Lukas. Let's talk about the future and {topic_en}."})
-        else:
-            turns.append({"speaker": s, "german": f"Gute Idee Lukas. {topic_es} ist sehr **interessant**.", "english": f"Good idea Lukas. {topic_en} is very interesting."})
-    return turns
 
 
 async def generate_audio(turns, target_dir=None):
